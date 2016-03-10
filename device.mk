@@ -264,44 +264,6 @@ PRODUCT_PACKAGES += \
   libgesture \
   libActivityInstant
 
-#ZenUI set
-PRODUCT_PACKAGES += \
-  AsusKeyboard \
-  libjni_xt9input \
-  AsusFMService \
-  OemTelephonyApp \
-  AsusBackup \
-  ASUSGalleryBurst \
-  libjni_picbest_static \
-  libjni_piclear_static \
-  libgifencoder \
-  3CToolbox \
-  PCLinkManager \
-  AsusInputDevices \
-  AsusCalculator \
-  AsusCamera \
-  ASUSGallery \
-  libjni_face_effect \
-  libgif \
-  libjni_face_detection \
-  libjni_filter_show \
-  SepService \
-  SMMI_TEST \
-  AsusFMRadio \
-  AsusLauncher \
-  libkcmutil \
-  ICEsoundService \
-  PCLinkBinary \
-  ASUSBrowser \
-  SensorCal \
-  AsusDrawRes \
-  MyASUS \
-  libBaiduMapSDK_v2_4_1 \
-  libbdpush_V2_2 \
-  CWSClientService \
-  SARManager \
-  ZenUIHelp \
-  AsusZenUIServices \
 
 #ituxd for intel thermal management
 ENABLE_ITUXD := true
