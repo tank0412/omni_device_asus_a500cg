@@ -89,4 +89,6 @@ include $(call all-makefiles-under,$(LOCAL_PATH))
 ifneq (,$(filter $(TARGET_BUILD_VARIANT),eng userdebug))
 -include linux/modules/PRIVATE/testbox/AndroidTB.mk
 endif
+# Hack for build
+$(shell mkdir -p $(OUT)/obj/KERNEL_OBJ/usr)
 endif
