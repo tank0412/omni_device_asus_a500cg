@@ -64,31 +64,31 @@ MALLOC_IMPL := dlmalloc
 BOARD_MALLOC_ALIGNMENT := 16
 
 # Appends path to ARM libs for Houdini
-PRODUCT_LIBRARY_PATH := $(PRODUCT_LIBRARY_PATH):/system/lib/arm:/system/lib/arm/nb
+#PRODUCT_LIBRARY_PATH := $(PRODUCT_LIBRARY_PATH):/system/lib/arm:/system/lib/arm/nb
 # Test build gcc4.9
 #TARGET_TOOLS_PREFIX := prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin/x86_64-linux-android-
 #TARGET_CC := prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin/x86_64-linux-android-gcc
 #PATH := $(shell pwd)/prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin:$(PATH)
 
 # Inline kernel building
-TARGET_KERNEL_BUILT_FROM_SOURCE := true
+#TARGET_KERNEL_BUILT_FROM_SOURCE := true
 #TARGET_KERNEL_SOURCE := linux/kernel
-KERNEL_SRC_DIR := linux/kernel
+#KERNEL_SRC_DIR := linux/kernel
 #TARGET_KERNEL_CONFIG := build69_defconfig
 #TARGET_KERNEL_SOURCE := kernel/asus/a500cg/kernel
-TARGET_KERNEL_CONFIG := cm_a500cg_defconfig
+#TARGET_KERNEL_CONFIG := cm_a500cg_defconfig
 #TARGET_KERNEL_CONFIG := i386_ctp_defconfig
 #KERNEL_CONFIG_OVERRIDE := device/asus/a500cg/asusctp_hd_diffconfig
-TARGET_KERNEL_ARCH := i386
-BOARD_KERNEL_IMAGE_NAME := bzImage
-KERNEL_TOOLCHAIN := $(ANDROID_BUILD_TOP)/prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin
-TARGET_KERNEL_CROSS_COMPILE_PREFIX := x86_64-linux-android-
-KERNEL_EXTRA_FLAGS := ANDROID_TOOLCHAIN_FLAGS=-mno-android
-KERNEL_SOC := ctp
+#TARGET_KERNEL_ARCH := i386
+#BOARD_KERNEL_IMAGE_NAME := bzImage
+#KERNEL_TOOLCHAIN := $(ANDROID_BUILD_TOP)/prebuilts/gcc/linux-x86/x86/x86_64-linux-android-4.9/bin
+#TARGET_KERNEL_CROSS_COMPILE_PREFIX := x86_64-linux-android-
+#KERNEL_EXTRA_FLAGS := ANDROID_TOOLCHAIN_FLAGS=-mno-android
+#KERNEL_SOC := ctp
 #remove time_macros from ccache options, it breaks signing process
-KERNEL_CCSLOP := $(filter-out time_macros,$(subst $(comma), ,$(CCACHE_SLOPPINESS)))
-KERNEL_CCSLOP := $(subst $(space),$(comma),$(KERNEL_CCSLOP))
-CCACHE_SLOPPINESS := $(KERNEL_CCSLOP)
+#KERNEL_CCSLOP := $(filter-out time_macros,$(subst $(comma), ,$(CCACHE_SLOPPINESS)))
+#KERNEL_CCSLOP := $(subst $(space),$(comma),$(KERNEL_CCSLOP))
+#CCACHE_SLOPPINESS := $(KERNEL_CCSLOP)
 #KERNEL_BLD_FLAGS := \
     ARCH=$(KERNEL_ARCH) \
     INSTALL_MOD_STRIP=1 \
@@ -195,11 +195,11 @@ $(call add-path-map, stlport:external/stlport/stlport \
 # DEVICE_BASE_RECOVERY_IMAGE := device/asus/a500cg/blobs/recovery-WW-3.23.40.52.img
 
 # prebuild source kernel
-BOARD_CUSTOM_BOOTIMG_MK := device/asus/a500cg/intel-boot-tools/boot.mk
-BOARD_CUSTOM_MKBOOTIMG := device/asus/a500cg/intel-boot-tools/boot.mk
-#TARGET_PREBUILT_KERNEL := device/asus/a500cg/kernel
-DEVICE_BASE_BOOT_IMAGE := device/asus/a500cg/blobs/boot_60.img
-DEVICE_BASE_RECOVERY_IMAGE := device/asus/a500cg/blobs/recovery_60.img
+#BOARD_CUSTOM_BOOTIMG_MK := device/asus/a500cg/intel-boot-tools/boot.mk
+#BOARD_CUSTOM_MKBOOTIMG := device/asus/a500cg/intel-boot-tools/boot.mk
+TARGET_PREBUILT_KERNEL := device/asus/a500cg/kernel
+#DEVICE_BASE_BOOT_IMAGE := device/asus/a500cg/blobs/boot_60.img
+#DEVICE_BASE_RECOVERY_IMAGE := device/asus/a500cg/blobs/recovery_60.img
 
 # Kernel config (reference only)
 BOARD_KERNEL_BASE := 0x10000000

@@ -25,9 +25,7 @@
 #include <media/stagefright/foundation/AMessage.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaDefs.h>
-#include <display/IMultiDisplayVideoControl.h>
-#include <display/MultiDisplayService.h>
-#include <display/MultiDisplayType.h>
+#include <display/MultiDisplayClient.h>
 
 using namespace android::intel;
 
@@ -38,8 +36,7 @@ class MultiDisplayVideoClient : public RefBase {
 private:
     int mSessionId;
     int mState;
-    sp<IMultiDisplayVideoControl> mVideo;
-    sp<IMDService> getService();
+    sp<MultiDisplayClient> mVideo;
     status_t prepare(int state, bool isProtected);
     void close();
 public:

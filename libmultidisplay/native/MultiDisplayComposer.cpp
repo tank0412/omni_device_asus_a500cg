@@ -19,542 +19,517 @@
 //#define LOG_NDEBUG 0
 
 #include <utils/Log.h>
+#include <utils/RefBase.h>
+#include <binder/Parcel.h>
+
 #include <binder/IServiceManager.h>
 #include <binder/IPCThreadState.h>
-#include <display/IMultiDisplayComposer.h>
-#include <display/MultiDisplayComposer.h>
+#include "MultiDisplayComposer.h"
 #include "drm_hdmi.h"
-#include "drm_hdcp.h"
+#ifdef TARGET_HAS_ISV
+#include "VPPSetting.h"
+#endif
 
 namespace android {
 namespace intel {
-
 
 #define MDC_CHECK_INIT() \
 do { \
     if (mDrmInit == false) { \
         ALOGE("%s: drm_init fails", __func__); \
-        return MDS_ERROR; \
+        return NO_INIT; \
     } \
 } while(0)
 
-MultiDisplayListener::MultiDisplayListener(int msg,
-        const char* client, sp<IExtendDisplayListener> listener) {
-    mMsg = msg;
-    int len = strlen(client) + 1;
-    mName = new char[len];
-    strncpy(mName, client, len - 1);
-    *(mName + len - 1) = '\0';
-    ALOGV("%s: Register a new %s client, 0x%x", __func__, client, msg);
-    mIEListener = listener;
+#define CHECK_VIDEO_SESSION_ID(SESSIONID, ERR) \
+do { \
+    if (SESSIONID < 0 || SESSIONID >= MDS_VIDEO_SESSION_MAX_VALUE) { \
+        ALOGE("Invalid session ID %d", SESSIONID); \
+        return ERR; \
+    } \
+} while(0)
+
+
+MultiDisplayListener::MultiDisplayListener(int msg, int32_t id,
+        const char* client, sp<IMultiDisplayListener> listener) {
+    mMsg  = msg;
+    mId   = id;
+    mName = new String8(client);
+    mListener = listener;
 }
 
 MultiDisplayListener::~MultiDisplayListener() {
-    ALOGV("%s: Unregister client %s", __func__, mName);
     mMsg = 0;
-    delete [] mName;
+    mId = -1;
+    delete mName;
     mName = NULL;
-    mIEListener = NULL;
+    mListener = NULL;
 }
 
-MultiDisplayComposer::MultiDisplayComposer() {
-    mDrmInit = false;
-    mMode = 0;
-    mMipiPolicy = MDS_MIPI_OFF_NOT_ALLOWED;
-    mHdmiPolicy = MDS_HDMI_ON_ALLOWED;
-    memset((void*)(&mVideo), 0, sizeof(MDSVideoSourceInfo));
-    mMipiOn = true;
-    mWidiVideoExt = false;
-    mMipiReq = NO_MIPI_REQ;
-    mSurfaceComposer = NULL;
-    mScaleMode = 0;
-    mScaleStepX = 0;
-    mScaleStepY = 0;
-    mConnectStatus = 0;
+void MultiDisplayListener::dump() {
+    if (mName == NULL) {
+        ALOGE("Error listener");
+        return;
+    }
+    ALOGV("Listener info: %d, %d, %s, %p",
+            mMsg, mId, mName->string(), mListener.get());
+}
 
-    // Default value
-    mDisplayCapability = MDS_HW_SUPPORT_WIDI;
 
-    initialize_l();
+void MultiDisplayVideoSession::dump(int index) {
+    if (mState < MDS_VIDEO_PREPARING ||
+            mState >= MDS_VIDEO_UNPREPARED)
+        return;
+    ALOGV("\t[%d] %d, %dx%d@%d", index, mState,
+            mInfo.displayW, mInfo.displayH, mInfo.frameRate);
+}
+
+MultiDisplayComposer::MultiDisplayComposer() :
+    mDrmInit(false),
+#ifdef TARGET_HAS_ISV
+    mDisplayId(MDS_DISPLAY_PRIMARY),
+#endif
+    mListenerId(0),
+    mMode(MDS_MODE_NONE),
+    mScaleType(MDS_SCALING_NONE),
+    mHorizontalStep(0),
+    mVerticalStep(0),
+    mSurfaceComposer(NULL),
+    mMDSCallback(NULL)
+{
+    init();
 }
 
 MultiDisplayComposer::~MultiDisplayComposer() {
     drm_cleanup();
-    if (!mListener.isEmpty()) {
-        mListener.clear();
+
+    // Remove all the listeners.
+    size_t size = mListeners.size();
+    if (size > 0) {
+        MultiDisplayListener* listener = NULL;
+        for (size_t i = 0; i < size; i++) {
+            listener = mListeners.valueAt(i);
+            delete listener;
+        }
+        mListeners.clear();
     }
+
+    mSurfaceComposer = NULL;
+    mMDSCallback = NULL;
 }
 
-int MultiDisplayComposer::getMode(bool wait) {
+void MultiDisplayComposer::init() {
+    if (!drm_init()) {
+        ALOGE("Fail to init drm");
+        return;
+    }
+
+    mDrmInit = true;
+
+    initVideoSessions_l();
+    updateHdmiConnectStatusLocked();
+    // TODO: if HDMI is connected, update vpp policy
+    //setDisplayState_l(MDS_DISPLAY_EXTERNAL, VPPSetting::isVppOn());
+}
+
+status_t MultiDisplayComposer::updateHdmiConnectStatusLocked() {
     MDC_CHECK_INIT();
-    if (wait)
-        mLock.lock();
-    else {
-        if (mLock.tryLock() == -EBUSY) {
-            //ALOGW("%s: couldn't hold lock", __func__);
+
+    int connectStatus = drm_hdmi_getConnectionStatus();
+    if (connectStatus == DRM_HDMI_CONNECTED) {
+        mMode |= MDS_HDMI_CONNECTED;
+    } else if (connectStatus == DRM_DVI_CONNECTED) {
+        mMode |= MDS_DVI_CONNECTED;
+    } else {
+        mMode &= ~(MDS_HDMI_CONNECTED | MDS_DVI_CONNECTED);
+        drm_hdmi_onHdmiDisconnected();
+    }
+    ALOGI("ConnectStatus is %d, mode is 0x%x", connectStatus, mMode);
+    return NO_ERROR;
+}
+
+status_t MultiDisplayComposer::registerCallback(const sp<IMultiDisplayCallback>& cbk) {
+    Mutex::Autolock lock(mMutex);
+    if (cbk.get() == NULL) {
+        ALOGE("Callback is null");
+        return BAD_VALUE;
+    }
+    mMDSCallback = cbk;
+
+    // Make sure the hdmi status is aligned
+    // between MDS and hwc.
+    updateHdmiConnectStatusLocked();
+    return NO_ERROR;
+}
+
+status_t MultiDisplayComposer::unregisterCallback(const sp<IMultiDisplayCallback>& cbk) {
+    Mutex::Autolock lock(mMutex);
+    mMDSCallback = NULL;
+    return NO_ERROR;
+}
+
+status_t MultiDisplayComposer::updateHdmiConnectionStatus(bool connected) {
+    Mutex::Autolock lock(mMutex);
+    return notifyHotplugLocked(MDS_DISPLAY_EXTERNAL, connected);
+}
+
+status_t MultiDisplayComposer::updateWidiConnectionStatus(bool connected) {
+    Mutex::Autolock lock(mMutex);
+    return notifyHotplugLocked(MDS_DISPLAY_VIRTUAL, connected);
+}
+
+status_t MultiDisplayComposer::notifyHotplugLocked(
+        MDS_DISPLAY_ID dispId, bool connected) {
+    ALOGI("Display ID:%d, connected state:%d", dispId, connected);
+    // Notify widi video extended mode
+    int mode = mMode;
+    // update vpp policy
+    //setVppState_l(dispId, connected);
+    if (dispId == MDS_DISPLAY_VIRTUAL) {
+        if (connected)
+            mMode |= MDS_WIDI_ON;
+        else
+            mMode &= ~MDS_WIDI_ON;
+        broadcastMessageLocked((int)MDS_MSG_MODE_CHANGE, &mMode, sizeof(mMode), false);
+        return NO_ERROR;
+    }
+    // Notify hdmi hotplug and switch audio
+    if (hasVideoPlaying_l()) {
+        mMode |= MDS_VIDEO_ON;
+    } else {
+        mMode &= ~MDS_VIDEO_ON;
+    }
+    updateHdmiConnectStatusLocked();
+
+    if (mode != mMode) {
+        int connection = connected ? 1 : 0;
+        broadcastMessageLocked((int)MDS_MSG_MODE_CHANGE, &mMode, sizeof(mMode), false);
+        drm_hdmi_notify_audio_hotplug(connected);
+    }
+    // set oversan compensation and scaling type
+    status_t result = UNKNOWN_ERROR;
+    // Check the callback implementation
+    if (mMDSCallback != NULL) {
+        if (mScaleType != MDS_SCALING_NONE)
+            result = mMDSCallback->setHdmiScalingType(MDS_SCALING_NONE);
+        if (result == NO_ERROR &&
+                (mHorizontalStep != 0 || mVerticalStep != 0))
+            result = mMDSCallback->setHdmiOverscan(0, 0);
+    }
+    // If not implemented in callback, call SurfaceFlinger directly!
+    if (result != NO_ERROR) {
+        if (mScaleType != MDS_SCALING_NONE ||
+                mHorizontalStep != 0 || mVerticalStep != 0)
+            result = setDisplayScalingLocked(MDS_SCALING_NONE, 0, 0);
+    }
+
+    if (result == NO_ERROR) {
+        mScaleType = MDS_SCALING_NONE;
+        mHorizontalStep = 0;
+        mVerticalStep = 0;
+    }
+
+    return NO_ERROR;
+}
+
+status_t MultiDisplayComposer::updateVideoState(int sessionId, MDS_VIDEO_STATE state) {
+    Mutex::Autolock lock(mMutex);
+    status_t result = NO_ERROR;
+    //FIXME: Video user space driver works at different process,
+    // When MDS receive a UNPREPARING or UNPREPARED state,
+    // video driver may has been unloaded,
+    // if MDS still broadcast unprepared message to video driver,
+    // it may cause a Binder erorr.
+    bool ignoreVideoDriver = false;
+
+    ALOGV("set Video Session [%d] state:%d", sessionId, state);
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(sessionId, UNKNOWN_ERROR);
+    if (mVideos[sessionId].getState() == state) {
+        ALOGW("same video playback state %d for session %d", state, sessionId);
+        return NO_ERROR;
+    }
+
+    if (mVideos[sessionId].setState(state) != NO_ERROR) {
+        ALOGW("failed to update state %d for session %d", state, sessionId);
+        return UNKNOWN_ERROR;
+    }
+
+    // Reset video session if player is closed
+    if (state >= MDS_VIDEO_UNPREPARED) {
+        mVideos[sessionId].init();
+        ignoreVideoDriver = true;
+    }
+
+    int mode = mMode;
+    if (hasVideoPlaying_l())
+        mMode |= MDS_VIDEO_ON;
+    else
+        mMode &= ~MDS_VIDEO_ON;
+
+    if (mMDSCallback != NULL)
+        result = mMDSCallback->updateVideoState(sessionId, state);
+    if (mode != mMode) {
+        broadcastMessageLocked((int)MDS_MSG_MODE_CHANGE,
+                &mMode, sizeof(mMode), ignoreVideoDriver);
+    }
+
+    return result;
+}
+
+MDS_VIDEO_STATE MultiDisplayComposer::getVideoState(int sessionId) {
+    Mutex::Autolock lock(mMutex);
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(sessionId, MDS_VIDEO_STATE_UNKNOWN);
+    ALOGV("get Video Session [%d] state %d", sessionId, mVideos[sessionId].getState());
+    return mVideos[sessionId].getState();
+}
+
+int MultiDisplayComposer::getVideoSessionNumber() {
+    //TODO: avoid deadlock issue in HWC
+    //Mutex::Autolock lock(mMutex);
+    return getVideoSessionSize_l();
+}
+
+status_t MultiDisplayComposer::updateVideoSourceInfo(int sessionId, const MDSVideoSourceInfo& info) {
+    MDC_CHECK_INIT();
+    Mutex::Autolock lock(mMutex);
+    ALOGV("mode[0x%x]protected[%d]w[%d]h[%d]fps[%d]interlace[%d]",
+        mMode, info.isProtected, info.displayW,
+        info.displayH, info.frameRate, info.isInterlaced);
+
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(sessionId, UNKNOWN_ERROR);
+    if (mVideos[sessionId].setInfo(info) != NO_ERROR)
+        return UNKNOWN_ERROR;
+    dumpVideoSession_l();
+    return NO_ERROR;
+}
+
+status_t MultiDisplayComposer::getVideoSourceInfo(int sessionId, MDSVideoSourceInfo *info) {
+    if (info == NULL)
+        return BAD_VALUE;
+    Mutex::Autolock lock(mMutex);
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(sessionId, UNKNOWN_ERROR);
+    if (mVideos[sessionId].getState() != MDS_VIDEO_PREPARED)
+        return UNKNOWN_ERROR;
+    return mVideos[sessionId].getInfo(info);
+}
+
+status_t MultiDisplayComposer::updatePhoneCallState(bool blank) {
+    Mutex::Autolock lock(mMutex);
+    ALOGV("the phone call state : %d", blank);
+    if (mMDSCallback == NULL)
+        return NO_INIT;
+    return mMDSCallback->blankSecondaryDisplay(blank);
+}
+
+status_t MultiDisplayComposer::updateInputState(bool state) {
+    Mutex::Autolock lock(mMutex);
+    ALOGV("the input state:%d", state);
+    if (mMDSCallback == NULL)
+        return NO_INIT;
+    return mMDSCallback->updateInputState(state);
+}
+
+status_t MultiDisplayComposer::setHdmiTiming(const MDSHdmiTiming& timing) {
+    Mutex::Autolock lock(mMutex);
+
+    if (mMDSCallback == NULL)
+        return NO_INIT;
+    MDSHdmiTiming real;
+    memcpy(&real, &timing, sizeof(MDSHdmiTiming));
+    if (!drm_hdmi_checkTiming(&real))
+        return UNKNOWN_ERROR;
+
+    return mMDSCallback->setHdmiTiming(real);
+}
+
+int MultiDisplayComposer::getHdmiTimingCount() {
+    Mutex::Autolock lock(mMutex);
+
+    return drm_hdmi_getTimingNumber();
+}
+
+status_t MultiDisplayComposer::getHdmiTimingList(
+        int count, MDSHdmiTiming **list) {
+    Mutex::Autolock lock(mMutex);
+    bool ret = drm_hdmi_getTimings(count, list);
+    return (ret == false ? UNKNOWN_ERROR : NO_ERROR);
+}
+
+status_t MultiDisplayComposer::getCurrentHdmiTiming(MDSHdmiTiming* timing) {
+    Mutex::Autolock lock(mMutex);
+    if (timing == NULL)
+        return UNKNOWN_ERROR;
+    return drm_hdmi_get_current_timing(timing);
+}
+
+status_t MultiDisplayComposer::setHdmiTimingByIndex(int index) {
+    Mutex::Autolock lock(mMutex);
+
+    return UNKNOWN_ERROR;
+}
+
+int MultiDisplayComposer::getCurrentHdmiTimingIndex() {
+    Mutex::Autolock lock(mMutex);
+    return -1;
+}
+
+status_t MultiDisplayComposer::setHdmiScalingType(MDS_SCALING_TYPE type) {
+    ALOGV("set scaling type:%d", type);
+    Mutex::Autolock lock(mMutex);
+    status_t result = UNKNOWN_ERROR;
+    // Check the callback implementation
+    if (mMDSCallback != NULL)
+        result = mMDSCallback->setHdmiScalingType(type);
+
+    // If not implemented in callback, call SurfaceFlinger directly!
+    if (result != NO_ERROR)
+        result = setDisplayScalingLocked((uint32_t)type,
+            mHorizontalStep, mVerticalStep);
+
+    if (result == NO_ERROR)
+        mScaleType = type;
+
+    return result;
+}
+
+status_t MultiDisplayComposer::setHdmiOverscan(int hVal, int vVal) {
+    Mutex::Autolock lock(mMutex);
+    status_t result = UNKNOWN_ERROR;
+    hVal = (hVal > overscan_max) ? 0: (overscan_max - hVal);
+    vVal = (vVal > overscan_max) ? 0: (overscan_max - vVal);
+    ALOGV("set overscan, h_val:%d, v_val:%d", hVal, vVal);
+    // Check the callback implementation
+    if (mMDSCallback != NULL)
+        result = mMDSCallback->setHdmiOverscan(hVal, vVal);
+
+    // If not implemented in callback, call SurfaceFlinger directly!
+    if (result != NO_ERROR)
+        result = setDisplayScalingLocked(
+                (uint32_t)mScaleType, hVal, vVal);
+
+    if (result == NO_ERROR) {
+        mHorizontalStep = hVal;
+        mVerticalStep = vVal;
+    }
+    return result;
+}
+
+MDS_DISPLAY_MODE MultiDisplayComposer::getDisplayMode(bool wait) {
+    if (wait) {
+        mMutex.lock();
+    } else {
+        if (mMutex.tryLock() == -EBUSY) {
             return MDS_MODE_NONE;
         }
     }
-    int mode = mMode;
-    mLock.unlock();
+    //ALOGV("Mode is 0x%x, %d", mMode, wait);
+    MDS_DISPLAY_MODE mode = (MDS_DISPLAY_MODE)mMode;
+    mMutex.unlock();
     return mode;
 }
 
-int MultiDisplayComposer::notifyWidi(bool on) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mMipiLock);
-    mWidiVideoExt = on;
-    if (mWidiVideoExt)
-        mMode |= MDS_WIDI_ON;
-    else
-        mMode &= ~MDS_WIDI_ON;
-
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::notifyMipi(bool on) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mMipiLock);
-    mMipiReq = on ? MIPI_ON_REQ : MIPI_OFF_REQ;
-    mMipiCon.signal();
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::setHdmiPowerOff() {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    drm_hdmi_setHdmiPowerOff();
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::prepareForVideo(int status) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    if (mVideoState == status)
-        return MDS_NO_ERROR;
-    ALOGV("%s: Video status %d", __func__, status);
-    mVideoState = status;
-    broadcastMessage_l(MDS_SET_VIDEO_STATUS, &status, sizeof(status));
-    if (status == (int)MDS_VIDEO_UNPREPARED) {
-        MDSVideoSourceInfo info;
-        memset(&mVideo, 0, sizeof(info));
-        return setHdmiMode_l();
+int32_t MultiDisplayComposer::registerListener(
+        const sp<IMultiDisplayListener>& listener,
+        const char* name, int msg) {
+    if (name == NULL || msg == 0 ||
+            listener.get() == NULL) {
+        ALOGE("Fail to register a new listener");
+        return -1;
     }
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::getVideoState() {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    return mVideoState;
-}
-
-int MultiDisplayComposer::updateVideoInfo(const MDSVideoSourceInfo& info) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    ALOGV("update video info: \
-        \n mode: 0x%x, \
-        \n is playing: %d, \
-        \n is protected Content: %d, \
-        \n displayW: %d, \
-        \n displayH: %d, \
-        \n frameRate: %d, \
-        \n is Interlaced: %d",
-        mMode, info.isPlaying, info.isProtected,
-        info.displayW, info.displayH, info.frameRate, info.isInterlaced);
-
-    memcpy(&mVideo, &info, sizeof(MDSVideoSourceInfo));
-
-    return setHdmiMode_l();
-}
-
-
-int MultiDisplayComposer::setHdmiMode_l() {
-    ALOGV("Entering %s, current mode = %#x", __func__, mMode);
-    MDSHDMITiming timing;
-    memset(&timing, 0, sizeof(MDSHDMITiming));
-
-    // Common case, update video status
-    if (mVideo.isPlaying) {
-        mMode |= MDS_VIDEO_PLAYING;
-    } else {
-        mMode &= ~MDS_VIDEO_PLAYING;
+    Mutex::Autolock _l(mMutex);
+    if (mListeners.size() >= MDS_LISTENER_MAX_VALUE ||
+            mListenerId >= MDS_LISTENER_MAX_VALUE) {
+        ALOGE("Up to the maximum of listener %d", MDS_LISTENER_MAX_VALUE);
+        return -1;
     }
-    // Common case, check HDMI connect status
-    int connectStatus = getHdmiPlug_l();
-#if !defined(DVI_SUPPORTED)
-    if (connectStatus == DRM_DVI_CONNECTED) {
-        ALOGE("%s: DVI is connected but is not supported for now.", __func__);
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-        mConnectStatus = connectStatus;
-        return MDS_ERROR;
-    }
-#endif
-    // Common case, turn on MIPI if necessary
-    if (connectStatus == DRM_HDMI_DISCONNECTED ||
-        mHdmiPolicy == MDS_HDMI_ON_NOT_ALLOWED ||
-        mVideo.isPlaying == false) {
-        mMipiPolicy = MDS_MIPI_OFF_NOT_ALLOWED;
-        if (!checkMode(mMode, MDS_MIPI_ON)) {
-            ALOGI("Turn on MIPI.");
-            drm_mipi_setMode(DRM_MIPI_ON);
-            mMode |= MDS_MIPI_ON;
-            mMipiOn = true;
+    int32_t newId = mListenerId;
+    for (size_t i = 0; i < mListeners.size(); i++) {
+        if (mListeners.keyAt(i) == newId) {
+            ALOGE("The listener %p is already registered!", listener.get());
+            return -1;
         }
     }
-    // Common case, HDMI is disconnected
-    if (connectStatus == DRM_HDMI_DISCONNECTED) {
-        ALOGI("HDMI is disconnected.");
-        if (!checkMode(mMode, MDS_HDMI_CONNECTED)) {
-            ALOGW("HDMI is already in disconnected state.");
-            broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-            mConnectStatus = connectStatus;
-            return MDS_NO_ERROR;
+    MultiDisplayListener* plistener =
+        new MultiDisplayListener(msg, newId, name, listener);
+    plistener->dump();
+    mListeners.add(newId, plistener);
+    mListenerId++;
+    // Find a valid Id
+    if (mListenerId >= MDS_LISTENER_MAX_VALUE) {
+        mListenerId = 0;
+        for (; mListenerId < MDS_LISTENER_MAX_VALUE; mListenerId++) {
+            bool used = false;
+            for (size_t i = 0; i < mListeners.size(); i++) {
+                if (mListeners.keyAt(i) == mListenerId) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) break;
         }
-
-        ALOGV("Notify HDMI audio driver hot unplug event.");
-        drm_hdmi_notify_audio_hotplug(false);
-        drm_hdcp_disable_hdcp(false);
-        mMode &= ~MDS_HDMI_CONNECTED;
-        mMode &= ~MDS_HDMI_ON;
-        mMode &= ~MDS_HDCP_ON;
-        mMode &= ~MDS_HDMI_CLONE;
-        mMode &= ~MDS_HDMI_VIDEO_EXT;
-        mMode &= ~MDS_OVERLAY_OFF;
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-        drm_hdmi_onHdmiDisconnected();
-        mConnectStatus = connectStatus;
-        return MDS_NO_ERROR;
+        ALOGV("The next valid listener Id: %d", mListenerId);
     }
-
-    ALOGI("HDMI is connected.");
-    bool notify_audio_hotplug = (mMode & MDS_HDMI_CONNECTED) == 0;
-    mMode |= MDS_HDMI_CONNECTED;
-
-    // Common case, check HDMI policy
-    if (mHdmiPolicy == MDS_HDMI_ON_NOT_ALLOWED) {
-        ALOGI("HDMI on is not allowed. Turning off HDMI...");
-        if (mConnectStatus != connectStatus &&
-               notify_audio_hotplug && mDrmInit) {
-            // Do not need to notify HDMI audio driver about hotplug during startup.
-            ALOGV("Notify HDMI audio drvier hot plug event.");
-            drm_hdmi_notify_audio_hotplug(true);
-            mConnectStatus = connectStatus;
-        }
-        if (!checkMode(mMode, MDS_HDMI_ON)) {
-            ALOGW("HDMI is already in off state.");
-            broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-            return MDS_NO_ERROR;
-        }
-        if (checkMode(mMode, MDS_HDCP_ON)) {
-            drm_hdcp_disable_hdcp(true);
-        }
-        mMode &= ~MDS_HDCP_ON;
-        mMode &= ~MDS_HDMI_ON;
-        mMode &= ~MDS_HDMI_CLONE;
-        mMode &= ~MDS_HDMI_VIDEO_EXT;
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-        drm_hdmi_setHdmiVideoOff();
-        return MDS_NO_ERROR;
-    }
-    mConnectStatus = connectStatus;
-
-    if (mVideo.isPlaying && checkMode(mMode, MDS_HDMI_VIDEO_EXT)) {
-        ALOGW("HDMI is already in Video Extended mode.");
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-        return MDS_NO_ERROR;
-    } else if (!mVideo.isPlaying && checkMode(mMode, MDS_HDMI_CLONE)) {
-        ALOGW("HDMI is already in cloned state.");
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-        return MDS_NO_ERROR;
-    }
-    // Common case, turn off overlay temporarily during mode transition.
-    // Make sure overlay is turned on when this function exits.
-    // Transition mode starts with standalone local mipi mode (no cloned, no video extended).
-    int transitionalMode = mMode;
-    transitionalMode &= ~MDS_HDMI_CLONE;
-    transitionalMode &= ~MDS_HDMI_VIDEO_EXT;
-    transitionalMode |= MDS_OVERLAY_OFF;
-    broadcastMessage_l(MDS_MODE_CHANGE, &transitionalMode, sizeof(transitionalMode));
-
-    //Before HDMI mode change, disalbe HDCP
-    if (checkMode(mMode, MDS_HDCP_ON)) {
-        ALOGV("Turning off HDCP before mode change");
-        drm_hdcp_disable_hdcp(true);
-        mMode &= ~MDS_HDCP_ON;
-    }
-
-    // Common case, notify HWC to set HDMI timing if need
-    if (mVideo.isPlaying) {
-        // disable dynamic mode setting for presentation mode
-        if (isHdmiTimingDynamicSettingEnable_l()) {
-            ALOGI("Video is in playing state. Mode = %#x", mMode);
-            timing.width = mVideo.displayW;
-            timing.height = mVideo.displayH;
-            timing.refresh = mVideo.frameRate;
-            timing.interlace = 0;
-            timing.ratio = 0;
-            drm_hdmi_getTiming(DRM_HDMI_VIDEO_EXT, &timing);
-            setHdmiTiming_l((void*)&timing, sizeof(MDSHDMITiming));
-        }
-    } else {
-        ALOGV("Video is not in playing state. Mode = %#x", mMode);
-        drm_hdmi_getTiming(DRM_HDMI_CLONE, &timing);
-        setHdmiTiming_l((void*)&timing, sizeof(MDSHDMITiming));
-    }
-    // Common case, turn on HDCP
-    if (drm_hdcp_enable_hdcp() == false) {
-        ALOGE("Fail to enable HDCP.");
-        // Continue mode setting as it may be recovered, unless HDCP is not supported.
-        // If HDCP is not supported, user will have to unplug the cable to restore video to phone.
-    } else {
-        ALOGV("Turning on HDCP...");
-        mMode |= MDS_HDCP_ON;
-    }
-    // Common case, prolong overlay off time
-    mMode |= MDS_OVERLAY_OFF;
-    if (mVideo.isPlaying) {
-        mMode |= MDS_HDMI_VIDEO_EXT;
-        mMode &= ~MDS_HDMI_CLONE;
-        mMipiPolicy = MDS_MIPI_OFF_ALLOWED;
-    } else {
-        mMode &= ~MDS_HDMI_VIDEO_EXT;
-        mMode |= MDS_HDMI_CLONE;
-    }
-    broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-
-    // Common case, turn on HDMI if need
-    if (!checkMode(mMode, MDS_HDMI_ON)) {
-        ALOGI("Turn on HDMI...");
-        if (!drm_hdmi_setHdmiVideoOn()) {
-            ALOGI("Fail to turn on HDMI.");
-        }
-        mMode |= MDS_HDMI_ON;
-        broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-    }
-
-    // Common case, notify HWC to turn on Overlay if need
-    if (checkMode(mMode, MDS_HDMI_VIDEO_EXT)) {
-        //Enable overlay lastly
-        mMode &= ~MDS_OVERLAY_OFF;
-    }
-    broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-
-    // Common case, notify audio driver if need
-    if (notify_audio_hotplug && mDrmInit) {
-        // Do not need to notify HDMI audio driver about hotplug during startup.
-        ALOGV("Notify HDMI audio drvier hot plug event.");
-        drm_hdmi_notify_audio_hotplug(true);
-    }
-
-    ALOGV("Leaving %s, new mode is %#x", __func__, mMode);
-    return MDS_NO_ERROR;
+    return newId;
 }
 
-void MultiDisplayComposer::broadcastMessage_l(int msg, void* value, int size) {
-    for (unsigned int index = 0; index < mListener.size(); index++) {
-        MultiDisplayListener* listener = mListener.valueAt(index);
+status_t MultiDisplayComposer::unregisterListener(int32_t listenerId) {
+    Mutex::Autolock _l(mMutex);
+    if (listenerId < 0) {
+        ALOGE("Error listener ID");
+        return BAD_VALUE;
+    }
+    for (size_t i = 0; i < mListeners.size(); i++) {
+        if (mListeners.keyAt(i) != listenerId)
+            continue;
+        MultiDisplayListener* listener = mListeners.valueAt(i);
         if (listener == NULL)
             continue;
-        if (listener->getName() != NULL)
-            ALOGV("%s: Broadcast message 0x%x to %s, 0x%x", __func__, msg, listener->getName(), *((int*)value));
+        ALOGV("Find a matched listener to unregister:\n");
+        listener->dump();
+        mListeners.removeItem(listenerId);
+        delete listener;
+        listener = NULL;
+        break;
+    }
+    return NO_ERROR;
+}
+
+void MultiDisplayComposer::broadcastMessageLocked(
+        int msg, void* value, int size, bool ignoreVideoDriver) {
+    if (mListeners.size() == 0)
+        return;
+
+    for (size_t index = 0; index < mListeners.size(); index++) {
+        MultiDisplayListener* listener = mListeners.valueAt(index);
+        if (listener == NULL)
+            continue;
+        listener->dump();
+        const char* name = listener->getName();
+        if (ignoreVideoDriver && name != NULL &&
+                !strncmp("VideoDriver", name, sizeof("VideoDriver"))) {
+            ALOGV("Ignoring an invalid video driver message");
+            continue;
+        }
         if (listener->checkMsg(msg)) {
-            sp<IExtendDisplayListener> ielistener = listener->getIEListener();
+            sp<IMultiDisplayListener> ielistener = listener->getListener();
             if (ielistener != NULL)
                 ielistener->onMdsMessage(msg, value, size);
         }
     }
 }
 
-int MultiDisplayComposer::setHdmiTiming_l(void* value, int size) {
-    int ret = MDS_ERROR;
-    sp<IExtendDisplayListener> ielistener = NULL;
-    bool hasHwc = false;
-    for (unsigned int index = 0; index < mListener.size(); index++) {
-        MultiDisplayListener* listener = mListener.valueAt(index);
-        if (listener == NULL)
-            continue;
-        char* client = listener->getName();
-        if (client && !strncmp(client, "HWComposer", sizeof("HWComposer"))) {
-            hasHwc = true;
-            if (listener->checkMsg(MDS_SET_TIMING)) {
-                ALOGV("%s: Set HDMI timing through HWC", __func__);
-                ielistener = listener->getIEListener();
-                break;
-            }
-        }
-    }
-    if (ielistener != NULL)
-        ret = ielistener->onMdsMessage(MDS_SET_TIMING, value, size);
-    else if (!hasHwc)
-        ret = MDS_NO_ERROR;
-    return ret;
-}
-
-int MultiDisplayComposer::setMipiMode_l(bool on) {
-    Mutex::Autolock _l(mLock);
-
-    if (mMipiOn == on)
-        return MDS_NO_ERROR;
-
-    if (on) {
-        drm_mipi_setMode(DRM_MIPI_ON);
-        mMode |= MDS_MIPI_ON;
-    } else {
-        if(!mWidiVideoExt) {
-            if (!checkMode(mMode, MDS_HDMI_VIDEO_EXT)) {
-                ALOGW("%s: Attempt to turn off Mipi while not in extended video mode.", __func__);
-                broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-                return MDS_ERROR;
-            }
-            if (mMipiPolicy == MDS_MIPI_OFF_ALLOWED) {
-                drm_mipi_setMode(DRM_MIPI_OFF);
-                mMode &= ~MDS_MIPI_ON;
-            }
-        } else {
-            drm_mipi_setMode(DRM_MIPI_OFF);
-            mMode &= ~MDS_MIPI_ON;
-        }
-    }
-    mMipiOn = on;
-    ALOGI("Turn on/off mipi, %d", on);
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::notifyHotPlug() {
-    int ret = MDS_ERROR;
-    MDC_CHECK_INIT();
-    ALOGV("%s: mipi policy: %d, hdmi policy: %d, mode: 0x%x", __func__, mMipiPolicy, mHdmiPolicy, mMode);
-    Mutex::Autolock _l(mLock);
-    ret = setHdmiMode_l();
-    if (drm_hdmi_isDeviceChanged(false) && mConnectStatus == DRM_HDMI_CONNECTED)
-        setDisplayScalingLocked(0, 0, 0);
-    return ret;
-}
-
-int MultiDisplayComposer::setModePolicy(int policy) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    return setModePolicy_l(policy);
-}
-
-int MultiDisplayComposer::setModePolicy_l(int policy) {
-    int ret = 0;
-    unsigned int index = 0;
-    ALOGI("%s: policy %d, mHdmiPolicy 0x%x, mMipiPolicy 0x%x, mMode: 0x%x",
-            __func__, policy, mHdmiPolicy, mMipiPolicy, mMode);
-    switch (policy) {
-        case MDS_HDMI_ON_NOT_ALLOWED:
-        case MDS_HDMI_ON_ALLOWED:
-            mHdmiPolicy = policy;
-            return setHdmiMode_l();
-
-        case MDS_MIPI_OFF_NOT_ALLOWED:
-            mMipiPolicy = policy;
-            if (!checkMode(mMode, MDS_MIPI_ON)) {
-                drm_mipi_setMode(DRM_MIPI_ON);
-            }
-            mMode |= MDS_MIPI_ON;
-            mMipiOn = true;
-            break;
-        case MDS_MIPI_OFF_ALLOWED:
-            mMipiPolicy = policy;
-            if (checkMode(mMode, MDS_MIPI_ON)) {
-                drm_mipi_setMode(DRM_MIPI_OFF);
-            }
-            mMode &= ~MDS_MIPI_ON;
-            mMipiOn = false;
-            break;
-        default:
-            return MDS_ERROR;
-    }
-    broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::registerListener(
-                sp<IExtendDisplayListener> listener,
-                void *handle, const char* name, int msg) {
-    unsigned int i = 0;
-    MDC_CHECK_INIT();
-    if (name == NULL || msg == 0) {
-        ALOGE("%s: Failed to register a no-name or no-message client", __func__);
-        return MDS_ERROR;
-    }
-    Mutex::Autolock _l(mLock);
-    for (i = 0; i < mListener.size(); i++) {
-        if (mListener.keyAt(i) == handle) {
-            ALOGE("%s register error!", __func__);
-            return MDS_ERROR;
-        }
-    }
-    MultiDisplayListener* tlistener = new  MultiDisplayListener(msg, name, listener);
-    mListener.add(handle, tlistener);
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::unregisterListener(void *handle) {
-    unsigned int i = 0;
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    for (i = 0; i < mListener.size(); i++) {
-        if (mListener.keyAt(i) == handle) {
-            MultiDisplayListener* tlistener = mListener.valueAt(i);
-            mListener.removeItem(handle);
-            delete tlistener;
-            tlistener = NULL;
-            break;
-        }
-    }
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::getHdmiPlug_l() {
-    return drm_hdmi_getConnectionStatus();
-}
-
-int MultiDisplayComposer::getHdmiModeInfo(int* pWidth, int* pHeight,
-                                          int* pRefresh, int* pInterlace,
-                                          int *pRatio) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    ALOGV("%s: mMode: 0x%x", __func__, mMode);
-    if (pWidth == NULL || pHeight == NULL ||
-            pRefresh == NULL || pInterlace == NULL) {
-      return drm_hdmi_getModeInfo(NULL, NULL, NULL, NULL, NULL);
-    }
-    return drm_hdmi_getModeInfo(pWidth, pHeight, pRefresh, pInterlace, pRatio);
-}
-
-int MultiDisplayComposer::setHdmiModeInfo(int width, int height,
-                            int refresh, int interlace, int ratio) {
-    MDSHDMITiming timing;
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    ALOGV("%s: \
-        \n  mMode: %d, \
-        \n  width: %d, \
-        \n  height: %d, \
-        \n  refresh: %d, \
-        \n  ratio: %d, \
-        \n  interlace: %d",
-         __func__, mMode, width, height, refresh, ratio, interlace);
-
-    drm_hdmi_setModeInfo(width, height, refresh, interlace, ratio);
-    drm_hdmi_getTiming(DRM_HDMI_CLONE, &timing);
-    setHdmiTiming_l((void*)&timing, sizeof(MDSHDMITiming));
-    broadcastMessage_l(MDS_MODE_CHANGE, &mMode, sizeof(mMode));
-    return MDS_NO_ERROR;
-}
-
-int MultiDisplayComposer::setDisplayScalingLocked(uint32_t mode,
+status_t MultiDisplayComposer::setDisplayScalingLocked(uint32_t mode,
          uint32_t stepx, uint32_t stepy) {
     if (mSurfaceComposer == NULL) {
         const sp<IServiceManager> sm = defaultServiceManager();
         const String16 name("SurfaceFlinger");
         mSurfaceComposer = sm->getService(name);
         if (mSurfaceComposer == NULL) {
-            return -1;
+            return UNKNOWN_ERROR;
         }
     }
 
@@ -569,105 +544,174 @@ int MultiDisplayComposer::setDisplayScalingLocked(uint32_t mode,
     return reply.readInt32();
 }
 
-int MultiDisplayComposer::setHdmiScaleType(int type) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-
-    mScaleMode = type;
-    return setDisplayScalingLocked(mScaleMode, mScaleStepX, mScaleStepY);
-}
-
-int MultiDisplayComposer::setHdmiScaleStep(int hValue, int vValue) {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-
-    mScaleStepX = (hValue > 5) ? 0: (5 - hValue);
-    mScaleStepY = (vValue > 5) ? 0: (5 - vValue);
-    return setDisplayScalingLocked(mScaleMode, mScaleStepX, mScaleStepY);
-}
-
-int MultiDisplayComposer::getHdmiDeviceChange() {
-    MDC_CHECK_INIT();
-    Mutex::Autolock _l(mLock);
-    return drm_hdmi_isDeviceChanged(true);
-}
-
-int MultiDisplayComposer::getVideoInfo(int* dw, int* dh, int* fps, int* interlaced) {
-    MDC_CHECK_INIT();
-    //TODO: here don't need to lock mLock
-    if (!mVideo.isPlaying) {
-        ALOGE("%s: Video player is not in playing state", __func__);
-        return MDS_ERROR;
+int MultiDisplayComposer::getVideoSessionSize_l() {
+    int size = 0;
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++) {
+        if (mVideos[i].getState() != MDS_VIDEO_UNPREPARED)
+            size++;
     }
-    if (dw)
-        *dw = mVideo.displayW;
-    if (dh)
-        *dh = mVideo.displayH;
-    if (fps)
-        *fps = mVideo.frameRate;
-    if (interlaced)
-        *interlaced = mVideo.isInterlaced;
-    return MDS_NO_ERROR;
+    ALOGV("get video session number %d", size);
+    return size;
 }
 
-void MultiDisplayComposer::initialize_l() {
-    if (!drm_init()) {
-        ALOGE("%s: drm_init fails.", __func__);
-        return;
-    }
-    mDrmInit = true;
-    if (drm_hdmi_isSupported()) {
-        mDisplayCapability |= MDS_HW_SUPPORT_HDMI;
-        setModePolicy_l(MDS_HDMI_ON_ALLOWED);
-    }
-    setModePolicy_l(MDS_MIPI_OFF_NOT_ALLOWED);
-
-    // start mipi listener
-    run("MIPIListener", PRIORITY_URGENT_DISPLAY);
-}
-
-int MultiDisplayComposer::getDisplayCapability() {
-    return mDisplayCapability;
-}
-
-bool MultiDisplayComposer::threadLoop() {
-    bool mipiOn;
-    while(true) {
-        {
-            Mutex::Autolock _l(mMipiLock);
-            if (mMipiReq == NO_MIPI_REQ)
-                mMipiCon.wait(mMipiLock);
-            mipiOn = (mMipiReq == MIPI_ON_REQ) ? true : false;
-            mMipiReq = NO_MIPI_REQ;
-        }
-        setMipiMode_l(mipiOn);
-    }
-    return MDS_NO_ERROR;
-}
-
-bool MultiDisplayComposer::isHdmiTimingDynamicSettingEnable_l() {
-    // Always enable dynamic setting for video playback
-    return true;
-    // Presentation mode checking depends on GFX SF patch,
-    // this patch hasn't been ported
-    if (mSurfaceComposer == NULL) {
-        const sp<IServiceManager> sm = defaultServiceManager();
-        const String16 name("SurfaceFlinger");
-        mSurfaceComposer = sm->getService(name);
-        if (mSurfaceComposer == NULL) {
-            return true;
+int MultiDisplayComposer::allocateVideoSessionId() {
+    Mutex::Autolock lock(mMutex);
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++) {
+        if (mVideos[i].getState() == MDS_VIDEO_UNPREPARED) {
+            ALOGV("Allocate a new Video Session ID %d", i);
+            return i;
         }
     }
 
-    Parcel data, reply;
-    int ret = -1;
-    const String16 token("android.ui.ISurfaceComposer");
-    data.writeInterfaceToken(token);
-    status_t status = mSurfaceComposer->transact(SFIntelQueryPresentationMode, data, &reply);
-    if (status == NO_ERROR)
-        ret = reply.readInt32();
-    ALOGI("Enable HDMI Timing dynamic setting %d", ret);
-    return (ret ? false : true);
+    ALOGE("Fail to allocate session ID");
+    return -1;
+}
+
+void MultiDisplayComposer::initVideoSessions_l() {
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++) {
+        mVideos[i].init();
+    }
+}
+
+status_t MultiDisplayComposer::resetVideoPlayback() {
+    Mutex::Autolock lock(mMutex);
+    if (getVideoSessionSize_l() <= 0)
+        return NO_ERROR;
+
+    // TODO: for each video session, send MDS_VIDEO_UNPREPARED
+    initVideoSessions_l();
+
+    if (mMDSCallback != NULL) {
+        mMDSCallback->updateVideoState(-1, MDS_VIDEO_UNPREPARED);
+    }
+
+    // exit extended mode
+    mMode &= ~MDS_VIDEO_ON;
+    broadcastMessageLocked((int)MDS_MSG_MODE_CHANGE, &mMode, sizeof(mMode), false);
+
+    return NO_ERROR;
+}
+
+bool MultiDisplayComposer::hasVideoPlaying_l() {
+    int size = 0;
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++) {
+        if (mVideos[i].getState() == MDS_VIDEO_PREPARED) {
+            size++;
+        }
+    }
+    return (size >= 1 ? true : false);
+}
+
+void MultiDisplayComposer::dumpVideoSession_l() {
+    ALOGV("All Video Session info:\n");
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++)
+        mVideos[i].dump(i);
+    return;
+}
+
+int MultiDisplayComposer::getValidDecoderConfigVideoSession_l() {
+    int index = -1;
+    int32_t width  = 0;
+    int32_t height = 0;
+    int32_t offX   = 0;
+    int32_t offY   = 0;
+    int32_t bufW   = 0;
+    int32_t bufH   = 0;
+    for (int i = 0; i < MDS_VIDEO_SESSION_MAX_VALUE; i++) {
+        if (mVideos[i].getDecoderOutputResolution(
+                    &width, &height, &offX, &offY, &bufW, &bufH) == NO_ERROR) {
+            index = i;
+            break;
+        }
+    }
+    return index;
+}
+
+//TODO: The input "sessionId" is ignored now
+status_t MultiDisplayComposer::getDecoderOutputResolution(
+        int sessionId, int32_t* width, int32_t* height,
+        int32_t* offX, int32_t* offY,
+        int32_t* bufWidth, int32_t* bufHeight) {
+    Mutex::Autolock lock(mMutex);
+    status_t result = NO_ERROR;
+    int index = getValidDecoderConfigVideoSession_l();
+    if (index < 0)
+        return UNKNOWN_ERROR;
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(index, UNKNOWN_ERROR);
+    result = mVideos[index].getDecoderOutputResolution(
+            width, height, offX, offY, bufWidth, bufHeight);
+    ALOGV("Video Session[%d]:Output resolution %dx%d, %dx%d, %dx%d",
+            index, *width, *height, *offX, *offY, *bufWidth, *bufHeight);
+    return result;
+}
+
+status_t MultiDisplayComposer::setDecoderOutputResolution(
+        int sessionId, int32_t width, int32_t height,
+        int32_t offX, int32_t offY,
+        int32_t bufWidth, int32_t bufHeight) {
+    Mutex::Autolock lock(mMutex);
+
+    // Check video session
+    CHECK_VIDEO_SESSION_ID(sessionId, UNKNOWN_ERROR);
+    ALOGV("set video session %d decoder Output resolution %dx%d, %dx%d, %dx%d",
+            sessionId, width, height, offX, offY, bufWidth, bufHeight);
+    return mVideos[sessionId].setDecoderOutputResolution(
+            width, height, offX, offY, bufWidth, bufHeight);
+}
+
+#ifdef TARGET_HAS_ISV
+status_t MultiDisplayComposer::setVppState_l(
+        MDS_DISPLAY_ID dpyId, bool connected, int status) {
+    // TODO: only for WIDI now
+    // the default Vpp policy for different display devices
+    // HDMI/MIPI: is enabled
+    // WIDI:      is disabled
+    // the logic in here is tricky, and will revert it after
+    // the usage of "MDS_WIDI_ON" is confirmed
+    // only set widi connector status when status set to -1
+    if (status == -1) {
+        if (dpyId != MDS_DISPLAY_VIRTUAL) {
+            return UNKNOWN_ERROR;
+        }
+        if (connected) {
+            mDisplayId = dpyId;
+        } else {
+            mDisplayId = MDS_DISPLAY_PRIMARY;
+        }
+        ALOGV("Leaving %s, %d", __func__, mDisplayId);
+    } else {
+        ALOGI("%s: VPP setting changed, ready to broadcast message.", __func__);
+        mMode |= MDS_VPP_CHANGED;
+        broadcastMessageLocked((int)MDS_MSG_MODE_CHANGE, &mMode, sizeof(mMode), false);
+        mMode &= ~MDS_VPP_CHANGED;
+    }
+    return NO_ERROR;
+}
+
+uint32_t MultiDisplayComposer::getVppState() {
+    bool ret = false;
+    uint32_t vpp_status = 0;
+
+    Mutex::Autolock lock(mMutex);
+    //TODO: only for WIDI now
+    if (mDisplayId != MDS_DISPLAY_VIRTUAL)
+        ret = VPPSetting::isVppOn(&vpp_status);
+    ALOGV("%s: vpp on %d, display id %d, vpp_status %d", __func__, ret, mDisplayId, vpp_status);
+    return vpp_status;
+}
+
+status_t MultiDisplayComposer::setVppState(
+        MDS_DISPLAY_ID dpyId, bool connected, int status) {
+    Mutex::Autolock lock(mMutex);
+    ALOGV("%s:%d, %d, %d", __func__, __LINE__, dpyId, connected);
+    return setVppState_l(dpyId, connected, status);
+}
+#endif
+
+bool MultiDisplayComposer::checkHdmiTimingIsFixed() {
+    Mutex::Autolock lock(mMutex);
+    return drm_hdmi_timing_is_fixed();
 }
 
 }; // namespace intel

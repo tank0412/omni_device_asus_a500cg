@@ -29,31 +29,30 @@ public class DisplaySetting {
     // mode setting policy
     public static final int HDMI_ON_NOT_ALLOWED  = 0;
     public static final int HDMI_ON_ALLOWED = 1;
+    public static final int MIPI_OFF_NOT_ALLOWED = 2;
+    public static final int MIPI_OFF_ALLOWED = 3;
 
-    /// Don't change the enum, pls align with MultiDisplayType.h
+    // display mode
+    // Don't change the enum, pls align with MultiDisplayType.h
+    // bit 0: MIPI on/off
+    // bit 3: HDMI connect status
+    // bit 4: HDMI on/off
+    // bit 5: HDMI clone mode
+    // bit 6: HDMI extend mode
+    public static final int MIPI_MODE_BIT           = 0x1;
+    public static final int HDMI_CONNECT_STATUS_BIT = 0x1 << 3;
+    public static final int HDMI_MODE_BIT           = 0x1 << 4;
+    public static final int HDMI_CLONE_MODE         = 0x1 << 5;
+    public static final int HDMI_EXTEND_MODE        = 0x1 << 6;
 
-    /// Phone call state
-    public static final int PHONE_STATE_OFF = 0;
-    public static final int PHONE_STATE_ON  = 1;
+    // MDS message type
+    public static final int MDS_MODE_CHANGE        = 0x1;
+    public static final int MDS_ORIENTATION_CHANGE = 0x1 << 1;
+    public static final int MDS_SET_TIMING         = 0x1 << 2;
 
-    /// MDS display mode
-    public static final int DVI_CONNECTED_BIT   = 1;
-    public static final int HDMI_CONNECTED_BIT  = 1 << 1;
-    public static final int WIDI_CONNECTED_BIT  = 1 << 2;
-    public static final int VIDEO_ON_BIT        = 1 << 3;
-
-    /// MDS message type
-    public static final int MDS_MSG_MODE_CHANGE = 1 << 1;
-    public static final int MDS_MSG_HOT_PLUG    = 1 << 2;
-
-    /// MDS display capability
-    public static final int DISPLAY_PRIMARY  = 0;
-    public static final int DISPLAY_EXTERNAL = 1;
-    public static final int DISPLAY_VIRTUAL  = 2;
-
-    /// External display device type
-    public static final int EDP_HDMI    = 1;
-    public static final int EDP_DVI     = 2;
+    // MDS display capability
+    public static final int HW_SUPPORT_HDMI = 0x1;
+    public static final int HW_SUPPORT_WIDI = 0x1 << 1;
 
     public static final String MDS_EDP_HOTPLUG         = "android.intel.mds.EXTERNAL_DP_HOTPLUG";
     public static final String MDS_GET_HDMI_INFO       = "android.intel.mds.GET.HDMI_INFO";
@@ -64,14 +63,15 @@ public class DisplaySetting {
     public static final String MDS_GET_BOOT_STATUS     = "android.intel.mds.GET.BOOT_STATUS";
     public static final String MDS_BOOT_STATUS         = "android.intel.mds.BOOT_STATUS";
     public static final String MDS_ALLOW_MODE_SET       = "android.intel.mds.ALLOW_MODE_SET";
-    public static final String MDS_SET_VPP_STATUS       = "android.intel.mds.SET.VPP_STATUS";
-
 
     private static onMdsMessageListener mListener = null;
 
     private static native boolean native_InitMDSClient(DisplaySetting thiz);
     private static native boolean native_DeInitMDSClient();
+    private static native boolean native_setModePolicy(int policy);
     private static native int     native_getMode();
+    private static native boolean native_setHdmiPowerOff();
+    private static native boolean native_notifyHotPlug();
     private static native int     native_getHdmiTiming(int width[],
                                                 int height[], int refresh[],
                                                 int interlace[], int ratio[]);
@@ -79,10 +79,11 @@ public class DisplaySetting {
                             int refresh, int interlace, int ratio);
     private static native int     native_getHdmiInfoCount();
     private static native boolean native_setHdmiScaleType(int Type);
-    private static native boolean native_setHdmiOverscan(int h, int v);
-    private static native int     native_updatePhoneCallState(boolean state);
-    private static native int     native_updateInputState(boolean state);
-    private static native int     native_setVppState(int dpyId, boolean state, int status);
+    private static native boolean native_setHdmiScaleStep(int Step, int Orientation);
+    private static native int     native_getHdmiDeviceChange();
+    private static native int     native_getDisplayCapability();
+    private static native int     native_setPlayInBackground(boolean value, int playerId);
+    private static native int     native_setHdcpStatus(int value);
 
     public DisplaySetting() {
         if (LOG) Slog.i(TAG, "Create a new DisplaySetting");
@@ -92,8 +93,20 @@ public class DisplaySetting {
     @Override
     protected void finalize() { native_DeInitMDSClient(); }
 
+    public boolean setModePolicy(int policy) {
+       return native_setModePolicy(policy);
+    }
+
     public int getMode() {
         return native_getMode();
+    }
+
+    public boolean notifyHotPlug() {
+        return native_notifyHotPlug();
+    }
+
+    public boolean setHdmiPowerOff() {
+        return native_setHdmiPowerOff();
     }
 
     public void onMdsMessage(int event, int value) {
@@ -132,20 +145,20 @@ public class DisplaySetting {
         return native_setHdmiScaleType(Type);
     }
 
-    public boolean setHdmiOverscan(int hValue, int vValue) {
-        return native_setHdmiOverscan(hValue, vValue);
+    public boolean setHdmiScaleStep(int Step, int Orientation) {
+        return native_setHdmiScaleStep(Step, Orientation);
     }
 
-    public int updatePhoneCallState(boolean phoneState) {
-        return native_updatePhoneCallState(phoneState);
+    public int getHdmiDeviceChange() {
+        return native_getHdmiDeviceChange();
     }
 
-    public int updateInputState(boolean inputState) {
-        return native_updateInputState(inputState);
+    public int getDisplayCapability() {
+        return native_getDisplayCapability();
     }
 
-    public int setVppState(int dpyId, boolean state, int status) {
-        return native_setVppState(dpyId, state, status);
+    public int setPlayInBackground(boolean enablePlayInBackground, int playerId) {
+        return native_setPlayInBackground(enablePlayInBackground, playerId);
     }
 }
 

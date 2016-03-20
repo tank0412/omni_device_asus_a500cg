@@ -16,53 +16,75 @@
  * Author: tianyang.zhu@intel.com
  */
 
-#ifndef ANDROID_MULTIDISPLAYSERVICE_H
-#define ANDROID_MULTIDISPLAYSERVICE_H
+#ifndef __ANDROID_INTEL_MULTIDISPLAYSERVICE_H__
+#define __ANDROID_INTEL_MULTIDISPLAYSERVICE_H__
+
 #include <utils/RefBase.h>
 #include <binder/IInterface.h>
 #include <binder/Parcel.h>
 #include <binder/BinderService.h>
-#include <display/IMultiDisplayComposer.h>
-#include <display/MultiDisplayComposer.h>
-#include <display/IExtendDisplayListener.h>
+
+#include <display/IMultiDisplayHdmiControl.h>
+#include <display/IMultiDisplayVideoControl.h>
+#include <display/IMultiDisplayEventMonitor.h>
+#include <display/IMultiDisplayCallbackRegistrar.h>
+#include <display/IMultiDisplaySinkRegistrar.h>
+#include <display/IMultiDisplayInfoProvider.h>
+#include <display/IMultiDisplayConnectionObserver.h>
+#include <display/IMultiDisplayDecoderConfig.h>
+#ifdef TARGET_HAS_ISV
+#include <display/IMultiDisplayVppConfig.h>
+#endif
+
 
 namespace android {
 namespace intel {
 
 #define INTEL_MDS_SERVICE_NAME "display.intel.mds"
 
-class MultiDisplayService:
-    public BinderService<MultiDisplayService>,
-    public BnMultiDisplayComposer {
-private:
-    MultiDisplayComposer* mMDC;
+class IMDService : public IInterface {
 public:
-    static char* const getServiceName() { return INTEL_MDS_SERVICE_NAME; }
-    static void instantiate();
+    DECLARE_META_INTERFACE(MDService);
+    virtual sp<IMultiDisplayHdmiControl>         getHdmiControl() = 0;
+    virtual sp<IMultiDisplayVideoControl>        getVideoControl() = 0;
+    virtual sp<IMultiDisplayEventMonitor>        getEventMonitor()  = 0;
+    virtual sp<IMultiDisplayCallbackRegistrar>   getCallbackRegistrar() = 0;
+    virtual sp<IMultiDisplaySinkRegistrar>       getSinkRegistrar() = 0;
+    virtual sp<IMultiDisplayInfoProvider>        getInfoProvider() = 0;
+    virtual sp<IMultiDisplayConnectionObserver>  getConnectionObserver() = 0;
+    virtual sp<IMultiDisplayDecoderConfig>       getDecoderConfig() = 0;
+#ifdef TARGET_HAS_ISV
+    virtual sp<IMultiDisplayVppConfig>           getVppConfig() = 0;
+#endif
+};
 
+class BnMDService : public BnInterface<IMDService> {
+public:
+    virtual status_t onTransact(uint32_t code,
+                                const Parcel& data,
+                                Parcel* replay,
+                                uint32_t flags = 0);
+};
+
+class MultiDisplayService : public BnMDService {
+public:
     MultiDisplayService();
     ~MultiDisplayService();
 
-    int getMode(bool wait);
-    int notifyWidi(bool);
-    int notifyMipi(bool);
-    int setModePolicy(int);
-    int notifyHotPlug();
-    int setHdmiPowerOff();
-    int prepareForVideo(int);
-    int getVideoState();
-    int updateVideoInfo(const MDSVideoSourceInfo&);
+    static char* const getServiceName() { return INTEL_MDS_SERVICE_NAME; }
+    static void instantiate();
 
-    int registerListener(sp<IExtendDisplayListener>, void *, const char *, int);
-    int unregisterListener(void *);
-
-    int getHdmiModeInfo(int* widht, int* height, int* refresh, int* interlace, int* ratio);
-    int setHdmiModeInfo(int widht, int height, int refresh, int interlace, int ratio);
-    int setHdmiScaleType(int type);
-    int setHdmiScaleStep(int hValue, int vValue);
-    int getHdmiDeviceChange();
-    int getVideoInfo(int* dw, int* dh, int* fps, int* interlace);
-    int getDisplayCapability();
+    virtual sp<IMultiDisplayHdmiControl>         getHdmiControl();
+    virtual sp<IMultiDisplayVideoControl>        getVideoControl();
+    virtual sp<IMultiDisplayEventMonitor>        getEventMonitor();
+    virtual sp<IMultiDisplayCallbackRegistrar>   getCallbackRegistrar();
+    virtual sp<IMultiDisplaySinkRegistrar>       getSinkRegistrar();
+    virtual sp<IMultiDisplayInfoProvider>        getInfoProvider();
+    virtual sp<IMultiDisplayConnectionObserver>  getConnectionObserver();
+    virtual sp<IMultiDisplayDecoderConfig>       getDecoderConfig();
+#ifdef TARGET_HAS_ISV
+    virtual sp<IMultiDisplayVppConfig>           getVppConfig();
+#endif
 };
 
 }; // namespace intel
